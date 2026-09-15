@@ -1,5 +1,5 @@
 import express from "express";
-import { createClient } from "redis";
+import { createSentinel } from "redis";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -32,7 +32,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4000);
 const INSTANCE_ID = process.env.INSTANCE_ID || `gw-${PORT}`;
 const SUPPLIER_URL = process.env.SUPPLIER_URL || "http://localhost:4001";
-const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+/**
+ * Sentinel endpoints, NOT a fixed primary address.
+ *
+ * Connecting to redis://localhost:6379 defeats the entire HA setup: when
+ * Sentinel promoted a replica, the gateways kept dialling the dead primary's
+ * address and reported the limiter as permanently unavailable. Redis failed
+ * over correctly and the application never noticed.
+ *
+ * Pointing the client at the sentinels makes it ask "who is primary now?" on
+ * every reconnect, so promotion is followed automatically. That indirection is
+ * the whole reason Sentinel exists — a fixed address cannot survive failover.
+ */
+const SENTINELS = (process.env.REDIS_SENTINELS || "localhost:26379,localhost:26380,localhost:26381")
+  .split(",")
+  .map((hp) => {
+    const [host, port] = hp.trim().split(":");
+    return { host, port: Number(port) };
+  });
+const SENTINEL_NAME = process.env.REDIS_SENTINEL_NAME || "mymaster";
 
 // Supplier now allows 500 req/s (realistic B2B contract). We claim 450 to
 // leave headroom for clock drift between our refill math and their window.
@@ -82,12 +100,46 @@ class CapacityError extends Error {}
  * The lesson generalizes past Redis: a fallback you have never exercised is a
  * hypothesis, not a safety net. This one was written, reviewed, and wrong.
  */
-const redis = createClient({
-  url: REDIS_URL,
-  disableOfflineQueue: true,
-  socket: {
-    connectTimeout: 2000,
-    reconnectStrategy: (retries) => Math.min(retries * 200, 3000),
+/**
+ * Sentinels report the Docker-internal address of whichever node is primary
+ * (172.30.0.10/.11/.12), and those are unroutable from the host. Without a
+ * translation the client discovers the right primary and then fails to reach
+ * it — a failover that "works" and still leaves the app disconnected.
+ *
+ * In production this map does not exist: services share the network with Redis
+ * and use the reported addresses directly. It is a local-dev artifact of
+ * running the app outside Docker and Redis inside it.
+ */
+const NODE_ADDRESS_MAP = {
+  "172.30.0.10:6379": { host: "localhost", port: 6379 },
+  "172.30.0.11:6379": { host: "localhost", port: 6380 },
+  "172.30.0.12:6379": { host: "localhost", port: 6381 },
+};
+
+const redis = createSentinel({
+  name: SENTINEL_NAME,
+  sentinelRootNodes: SENTINELS,
+  nodeAddressMap: NODE_ADDRESS_MAP,
+
+  /**
+   * scanInterval is deliberately left at its default of 0 (no periodic scan).
+   *
+   * Setting it to 2000 looked like the fix for a client that did not follow a
+   * failover, but an isolated test disproved that: a long-lived client sustained
+   * 20 consecutive writes at 1-3ms across the whole window, and the scan fired
+   * a MASTER_CHANGE event every 2s even though the master never changed —
+   * rebuilding connections continuously for no benefit. It was churn, not
+   * resilience, so it was reverted.
+   *
+   * The client follows promotions via sentinel push notifications; it does not
+   * need polling to do so.
+   */
+  nodeClientOptions: {
+    disableOfflineQueue: true,
+    socket: {
+      connectTimeout: 2000,
+      reconnectStrategy: (retries) => Math.min(retries * 200, 3000),
+    },
   },
 });
 redis.on("error", (e) => console.error(`[${INSTANCE_ID}] redis error`, e.message));
@@ -96,7 +148,7 @@ await redis.connect();
 // Belt and braces: even with the offline queue disabled, a command issued to a
 // socket that is mid-teardown can stall. This caps ANY Redis call so a slow
 // dependency can never become an unbounded wait on our own request path.
-const REDIS_OP_TIMEOUT_MS = 500;
+const REDIS_OP_TIMEOUT_MS = Number(process.env.REDIS_OP_TIMEOUT_MS || 500);
 function withTimeout(promise, ms = REDIS_OP_TIMEOUT_MS) {
   return Promise.race([
     promise,
@@ -289,5 +341,8 @@ setInterval(() => {
 }, 2000);
 
 app.listen(PORT, () => {
-  console.log(`[${INSTANCE_ID}] listening on :${PORT} -> ${SUPPLIER_URL}, redis ${REDIS_URL}`);
+  console.log(
+    `[${INSTANCE_ID}] listening on :${PORT} -> ${SUPPLIER_URL}, ` +
+    `redis via sentinels ${SENTINELS.map((s) => `${s.host}:${s.port}`).join(",")} (${SENTINEL_NAME})`
+  );
 });
