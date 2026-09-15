@@ -142,7 +142,26 @@ const redis = createSentinel({
     },
   },
 });
-redis.on("error", (e) => console.error(`[${INSTANCE_ID}] redis error`, e.message));
+/**
+ * LEADER DETECTION — note there is none of our own.
+ *
+ * We never ask "who is primary?" anywhere in this file. The library does it:
+ * it queries a sentinel at connect time, connects to whichever node is primary,
+ * and subscribes to the sentinels' pub/sub channel so a promotion is PUSHED to
+ * it. nodeAddressMap above only rewrites Docker-internal IPs to host ports.
+ *
+ * These listeners exist because three separate diagnoses of "the client does
+ * not follow failover" were made without ever watching these events from
+ * inside the gateway — the symptom was real, the explanations were guesses.
+ * topology-change is the library telling us exactly what it decided and when.
+ */
+redis.on("error", (e) => console.error(`[${INSTANCE_ID}] redis error: ${e.message}`));
+redis.on("topology-change", (t) => {
+  console.log(`[${INSTANCE_ID}] TOPOLOGY ${t.type} ${t.node ? `${t.node.host}:${t.node.port}` : ""}`);
+});
+redis.on("reconnecting", () => console.log(`[${INSTANCE_ID}] reconnecting...`));
+redis.on("ready", () => console.log(`[${INSTANCE_ID}] redis ready`));
+
 await redis.connect();
 
 // Belt and braces: even with the offline queue disabled, a command issued to a
