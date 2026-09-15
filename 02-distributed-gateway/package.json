@@ -1,0 +1,10 @@
+{
+  "name": "distributed-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "redis": "^4.7.0"
+  }
+}
