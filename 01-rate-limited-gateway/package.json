@@ -1,0 +1,13 @@
+{
+  "name": "rate-limited-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "supplier": "node src/supplier.js",
+    "gateway": "node src/gateway.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
