@@ -11,8 +11,13 @@
 
 cd "$(dirname "$0")"
 
-pkill -f "02-distributed-gateway/src" 2>/dev/null
-sleep 1
+# Kill by PORT, not by command line. These are Windows processes: Git Bash's
+# pkill cannot see their command lines, so pattern matching silently matches
+# nothing and the new instances then die on EADDRINUSE.
+for port in 4000 4001 4002 4003; do
+  powershell.exe -NoProfile -Command "Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id \$_.OwningProcess -Force -ErrorAction SilentlyContinue }" 2>/dev/null
+done
+sleep 2
 
 PORT=4000 node src/supplier.js > /tmp/sd-supplier.log 2>&1 &
 echo "supplier  pid=$!"

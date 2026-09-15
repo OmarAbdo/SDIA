@@ -1,0 +1,124 @@
+# REDIS HIGH AVAILABILITY — removing the SPoF
+# ===========================================
+#
+# The distributed limiter made Redis mandatory: every token acquisition goes
+# through it, so one node means one failure takes out rate limiting for the
+# whole fleet. This is 1 primary + 2 replicas + 3 sentinels.
+#
+# WHY SENTINEL AND NOT CLUSTER
+# Cluster shards the keyspace, which we do not need — the limiter is a handful
+# of keys, not a large dataset. Cluster would also forbid our Lua script from
+# touching keys in different slots. Sentinel keeps one logical primary and only
+# handles failover, which is the sole problem we actually have.
+#
+# WHY 3 SENTINELS, NOT 2
+# Failover needs a quorum. With 2, a partition leaves each side holding 1 vote
+# and neither reaches majority, so nothing is promoted. Odd counts avoid split
+# votes — the same reason Raft clusters are 3 or 5.
+#
+# WHY STATIC IPs (learned the hard way)
+# The first version used `sentinel monitor mymaster redis-primary 6379 2` with
+# `resolve-hostnames yes`. When the primary container died, Docker dropped the
+# name from its DNS, sentinels could no longer resolve their own master, and
+# each one entered TILT MODE — a self-protection state that SUSPENDS FAILOVER.
+# The primary stayed down and no replica was ever promoted: the HA setup failed
+# precisely when it was needed. Pinning IPs keeps sentinels able to observe the
+# dead node and vote.
+#
+# THE HONEST CAVEAT
+# Failover takes seconds and writes to the old primary in that window are lost.
+# For a rate limiter that is fine — the bucket self-heals from a full state and
+# the worst case is briefly allowing extra requests the supplier will reject.
+# This is exactly why Redis beats Raft here: we are not buying durability, we
+# are buying speed, and we can afford to lose this state.
+
+networks:
+  sdnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+services:
+  redis-primary:
+    image: redis:7-alpine
+    container_name: sd-redis-primary
+    ports: ["6379:6379"]
+    command: redis-server --appendonly no
+    networks:
+      sdnet:
+        ipv4_address: 172.30.0.10
+
+  redis-replica-1:
+    image: redis:7-alpine
+    container_name: sd-redis-replica-1
+    ports: ["6380:6379"]
+    command: redis-server --replicaof 172.30.0.10 6379 --appendonly no
+    depends_on: [redis-primary]
+    networks:
+      sdnet:
+        ipv4_address: 172.30.0.11
+
+  redis-replica-2:
+    image: redis:7-alpine
+    container_name: sd-redis-replica-2
+    ports: ["6381:6379"]
+    command: redis-server --replicaof 172.30.0.10 6379 --appendonly no
+    depends_on: [redis-primary]
+    networks:
+      sdnet:
+        ipv4_address: 172.30.0.12
+
+  # Sentinels watch the primary and elect a replacement when it dies.
+  #
+  #   "mymaster 172.30.0.10 6379 2" = 2 sentinels must agree it is down (quorum)
+  #   down-after 5000               = 5s of silence counts as down
+  #   failover-timeout 10000        = how long before a stalled failover retries
+  #
+  # Clients connect to the SENTINELS, not to a fixed host: they ask "who is
+  # primary right now?" and get redirected after a failover. That indirection is
+  # the whole point — no hardcoded primary address anywhere in the app.
+  sentinel-1:
+    image: redis:7-alpine
+    container_name: sd-sentinel-1
+    ports: ["26379:26379"]
+    depends_on: [redis-primary, redis-replica-1, redis-replica-2]
+    networks:
+      sdnet:
+        ipv4_address: 172.30.0.20
+    command: >
+      sh -c "echo 'port 26379' > /tmp/s.conf &&
+             echo 'sentinel monitor mymaster 172.30.0.10 6379 2' >> /tmp/s.conf &&
+             echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/s.conf &&
+             echo 'sentinel failover-timeout mymaster 10000' >> /tmp/s.conf &&
+             redis-sentinel /tmp/s.conf"
+
+  sentinel-2:
+    image: redis:7-alpine
+    container_name: sd-sentinel-2
+    ports: ["26380:26379"]
+    depends_on: [redis-primary, redis-replica-1, redis-replica-2]
+    networks:
+      sdnet:
+        ipv4_address: 172.30.0.21
+    command: >
+      sh -c "echo 'port 26379' > /tmp/s.conf &&
+             echo 'sentinel monitor mymaster 172.30.0.10 6379 2' >> /tmp/s.conf &&
+             echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/s.conf &&
+             echo 'sentinel failover-timeout mymaster 10000' >> /tmp/s.conf &&
+             redis-sentinel /tmp/s.conf"
+
+  sentinel-3:
+    image: redis:7-alpine
+    container_name: sd-sentinel-3
+    ports: ["26381:26379"]
+    depends_on: [redis-primary, redis-replica-1, redis-replica-2]
+    networks:
+      sdnet:
+        ipv4_address: 172.30.0.22
+    command: >
+      sh -c "echo 'port 26379' > /tmp/s.conf &&
+             echo 'sentinel monitor mymaster 172.30.0.10 6379 2' >> /tmp/s.conf &&
+             echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/s.conf &&
+             echo 'sentinel failover-timeout mymaster 10000' >> /tmp/s.conf &&
+             redis-sentinel /tmp/s.conf"

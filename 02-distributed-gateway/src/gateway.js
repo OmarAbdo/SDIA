@@ -52,9 +52,57 @@ const TOKEN_WAIT_MS = 5000;
 
 const luaScript = readFileSync(join(__dirname, "ratelimit.lua"), "utf8");
 
-const redis = createClient({ url: REDIS_URL });
+/**
+ * Distinguishes OUR load shedding from THEIR failure.
+ *
+ * Both used to throw a plain Error, so a request we rejected ourselves after
+ * waiting 5s for a token was reported as 502 "upstream failure" — blaming the
+ * supplier for our own backpressure. In the last load test that mislabelled
+ * ~10k requests.
+ *
+ * Operationally this is the difference between "we are at capacity, scale up
+ * or raise the limit" and "the supplier is down, page their integration
+ * owner". Same user-visible failure, completely different response.
+ */
+class CapacityError extends Error {}
+
+/**
+ * disableOfflineQueue is the critical setting.
+ *
+ * By default node-redis QUEUES commands while disconnected and replays them on
+ * reconnect, so a call made during an outage never settles — it just waits.
+ * Every `try/catch` around a Redis call is then dead code: the promise does not
+ * reject, it hangs, and the request hangs with it. That is how a Redis outage
+ * turned into three fully wedged gateways that could not even serve /health.
+ *
+ * With the offline queue disabled, commands fail FAST while disconnected, the
+ * catch blocks actually run, and the fail-open path becomes real instead of
+ * theoretical.
+ *
+ * The lesson generalizes past Redis: a fallback you have never exercised is a
+ * hypothesis, not a safety net. This one was written, reviewed, and wrong.
+ */
+const redis = createClient({
+  url: REDIS_URL,
+  disableOfflineQueue: true,
+  socket: {
+    connectTimeout: 2000,
+    reconnectStrategy: (retries) => Math.min(retries * 200, 3000),
+  },
+});
 redis.on("error", (e) => console.error(`[${INSTANCE_ID}] redis error`, e.message));
 await redis.connect();
+
+// Belt and braces: even with the offline queue disabled, a command issued to a
+// socket that is mid-teardown can stall. This caps ANY Redis call so a slow
+// dependency can never become an unbounded wait on our own request path.
+const REDIS_OP_TIMEOUT_MS = 500;
+function withTimeout(promise, ms = REDIS_OP_TIMEOUT_MS) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error("redis timeout")), ms)),
+  ]);
+}
 
 // ---------------------------------------------------------------------------
 // L1 CACHE — local, size-capped
@@ -89,7 +137,11 @@ let queueDepth = 0;
 
 const app = express();
 
-let stats = { 200: 0, 502: 0, 503: 0, l1: 0, l2: 0, upstream: 0, dedup: 0 };
+// `shed` counts 503s caused by token-wait timeout specifically, separate from
+// 503s caused by a full queue. Both are our own backpressure, but they say
+// different things: queue-full means we are saturated locally, shed means we
+// waited on the shared limiter and gave up. Different fixes.
+let stats = { 200: 0, 502: 0, 503: 0, l1: 0, l2: 0, upstream: 0, dedup: 0, shed: 0 };
 app.use((req, res, next) => {
   res.on("finish", () => { stats[res.statusCode] = (stats[res.statusCode] || 0) + 1; });
   next();
@@ -108,7 +160,7 @@ app.get("/price/:sku", async (req, res) => {
   // LAYER 1b — L2, shared Redis. ~1ms network, but shared across instances,
   // so one instance's fetch warms the cache for all of them.
   try {
-    const l2 = await redis.get(`price:${sku}`);
+    const l2 = await withTimeout(redis.get(`price:${sku}`));
     if (l2) {
       const data = JSON.parse(l2);
       l1Set(sku, data);
@@ -123,7 +175,14 @@ app.get("/price/:sku", async (req, res) => {
       const data = await inFlight.get(sku);
       stats.dedup++;
       return res.json({ ...data, cached: "dedup", instance: INSTANCE_ID });
-    } catch {
+    } catch (err) {
+      // De-dup couples fates: waiters inherit the leader's failure, so they
+      // must inherit its CLASSIFICATION too. Without this, one capacity
+      // rejection answers the leader 503 and every waiter 502.
+      if (err instanceof CapacityError) {
+        stats.shed++;
+        return res.status(503).json({ error: "gateway at capacity", instance: INSTANCE_ID });
+      }
       return res.status(502).json({ error: "upstream failure" });
     }
   }
@@ -138,7 +197,7 @@ app.get("/price/:sku", async (req, res) => {
     .then(async (data) => {
       l1Set(sku, data);
       try {
-        await redis.set(`price:${sku}`, JSON.stringify(data), { PX: L2_TTL_MS });
+        await withTimeout(redis.set(`price:${sku}`, JSON.stringify(data), { PX: L2_TTL_MS }));
       } catch { /* L2 write is best-effort */ }
       return data;
     })
@@ -151,6 +210,10 @@ app.get("/price/:sku", async (req, res) => {
     stats.upstream++;
     res.json({ ...data, cached: "miss", instance: INSTANCE_ID });
   } catch (err) {
+    if (err instanceof CapacityError) {
+      stats.shed++;
+      return res.status(503).json({ error: "gateway at capacity", instance: INSTANCE_ID });
+    }
     res.status(502).json({ error: "upstream failure", detail: String(err) });
   }
 });
@@ -161,10 +224,10 @@ app.get("/price/:sku", async (req, res) => {
 
 async function tryConsumeToken() {
   try {
-    const granted = await redis.eval(luaScript, {
+    const granted = await withTimeout(redis.eval(luaScript, {
       keys: [TOKENS_KEY, REFILL_KEY],
       arguments: [String(BUCKET_CAPACITY), String(REFILL_PER_SEC), String(Date.now())],
-    });
+    }));
     return granted === 1;
   } catch (e) {
     // FAIL OPEN: if Redis is unreachable, allow the call rather than taking
@@ -180,7 +243,8 @@ async function fetchWithRateLimit(sku, retries = 3) {
 
   while (!(await tryConsumeToken())) {
     if (Date.now() - start > TOKEN_WAIT_MS) {
-      throw new Error("timed out waiting for token");
+      // OUR limit, not theirs. Typed so the handler can answer 503.
+      throw new CapacityError("timed out waiting for token");
     }
     // FULL JITTER on the poll. Fixed 25ms made every waiter wake on the same
     // tick and collide; random spreads them across the window.
@@ -207,7 +271,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 app.get("/health", async (_req, res) => {
   let tokens = null;
-  try { tokens = await redis.get(TOKENS_KEY); } catch {}
+  // /health must answer even when Redis is down — an unbounded call here is
+  // what made all three gateways unreachable during the failover test.
+  try { tokens = await withTimeout(redis.get(TOKENS_KEY)); } catch { tokens = "unavailable"; }
   res.json({ instance: INSTANCE_ID, queueDepth, l1Size: l1.size, tokensRemaining: tokens });
 });
 
@@ -215,11 +281,11 @@ setInterval(() => {
   const total = stats[200] + stats[502] + stats[503];
   if (total === 0) return;
   console.log(
-    `[${INSTANCE_ID}] 200=${stats[200]} 502=${stats[502]} 503=${stats[503]} | ` +
+    `[${INSTANCE_ID}] 200=${stats[200]} 502=${stats[502]} 503=${stats[503]}(shed=${stats.shed}) | ` +
     `l1=${stats.l1} l2=${stats.l2} dedup=${stats.dedup} upstream=${stats.upstream} | ` +
     `queue=${queueDepth} l1size=${l1.size}`
   );
-  stats = { 200: 0, 502: 0, 503: 0, l1: 0, l2: 0, upstream: 0, dedup: 0 };
+  stats = { 200: 0, 502: 0, 503: 0, l1: 0, l2: 0, upstream: 0, dedup: 0, shed: 0 };
 }, 2000);
 
 app.listen(PORT, () => {
